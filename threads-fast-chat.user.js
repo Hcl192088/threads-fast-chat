@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.21
+// @version      0.5.22
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -1498,11 +1498,154 @@
     const { source, viewerIgId, message } = data;
     const user = source.get(message.sender?.__ref);
     const senderId = message.sender_fbid;
-    if (senderId && user?.id === senderId && user.igid && user.username) {
-      const sentByViewer = user.igid === viewerIgId;
-      return { senderId, sentByViewer, sender: sentByViewer ? '你自己' : `@${user.username}` };
+    if (senderId && user?.id === senderId && user.igid) {
+      const sentByViewer = String(user.igid) === String(viewerIgId);
+      const sender = sentByViewer ? '你自己' : (user.username ? `@${user.username}` : getChatPartnerName());
+      return { senderId, sentByViewer, sender, senderSource: 'native' };
     }
     return {};
+  }
+
+  function extractUsernameFromHref(href) {
+    if (!href || href.includes('/post/')) return '';
+    const match = href.match(/(?:^|\/\/[^/]+)\/@([^/?#]+)\/?$/);
+    return match ? `@${match[1]}` : '';
+  }
+
+  function extractNameFromAvatarAlt(alt) {
+    const raw = (alt || '').trim();
+    if (!raw) return '';
+    const zh = raw.match(/^(.+?)的大頭貼照$/);
+    if (zh?.[1]) return zh[1].trim();
+    const en = raw.match(/^(.+?)'s profile picture$/i);
+    if (en?.[1]) return en[1].trim();
+    return '';
+  }
+
+  function getChatPartnerName() {
+    const ignored = '#tcf-anki-modal, #tcf-drawer, #tcf-toolbar, div[role="grid"], nav';
+    const links = document.querySelectorAll('header a[href*="/@"], main a[href*="/@"]');
+    for (const a of links) {
+      if (a.closest(ignored)) continue;
+      const username = extractUsernameFromHref(a.getAttribute('href') || '');
+      if (username) return username;
+    }
+    const headings = document.querySelectorAll('header h1, header h2, header [role="heading"], main h1, main h2');
+    for (const h of headings) {
+      if (h.closest(ignored)) continue;
+      const text = (h.textContent || '').trim();
+      if (text && text.length <= 40 && !/^(訊息|私訊|Messages|Chats)$/i.test(text)) {
+        return text;
+      }
+    }
+    return '對方';
+  }
+
+  function detectMessageHorizontalAlign(msgEl) {
+    const d1 = msgEl.firstElementChild;
+    const d2 = d1?.firstElementChild;
+    const d3 = d2?.firstElementChild;
+    for (const el of [d2, d3, d1, msgEl.querySelector('[style*="--x-justifyContent"]')]) {
+      const style = el?.getAttribute?.('style') || '';
+      if (!style.includes('--x-justifyContent')) continue;
+      const match = style.match(/--x-justifyContent\s*:\s*([^;]+)/i);
+      const val = (match?.[1] || '').trim().toLowerCase();
+      if (val.includes('end') || val === 'right') return 'right';
+      if (val.includes('start') || val === 'left') return 'left';
+    }
+
+    const anchor =
+      msgEl.querySelector('a[href*="/post/"]') ||
+      Array.from(msgEl.querySelectorAll('span[dir="auto"]')).find(
+        (s) => !s.closest('[data-tcf-bar="1"], div[role="gridcell"]')
+      );
+    if (!anchor) return '';
+
+    const msgRect = msgEl.getBoundingClientRect();
+    let bubble = anchor;
+    for (let child = anchor, parent = anchor.parentElement; parent && child !== msgEl; child = parent, parent = parent.parentElement) {
+      const parentRect = parent.getBoundingClientRect();
+      const childRect = child.getBoundingClientRect();
+      const narrower = parentRect.width > 0 && childRect.width > 0 && parentRect.width - childRect.width >= 12;
+      if (narrower) {
+        bubble = child;
+        const cs = getComputedStyle(parent);
+        if (cs.display.includes('flex')) {
+          const dir = cs.flexDirection;
+          if (dir === 'row' || dir === 'row-reverse') {
+            const jc = cs.justifyContent;
+            const isEnd = jc === 'flex-end' || jc === 'end' || jc === 'right';
+            const isStart = jc === 'flex-start' || jc === 'start' || jc === 'left';
+            if (isEnd) return dir === 'row-reverse' ? 'left' : 'right';
+            if (isStart) return dir === 'row-reverse' ? 'right' : 'left';
+          } else if (dir === 'column' || dir === 'column-reverse') {
+            const self = getComputedStyle(child).alignSelf;
+            const ai = self && self !== 'auto' ? self : cs.alignItems;
+            if (ai === 'flex-end' || ai === 'end' || ai === 'right') return 'right';
+            if (ai === 'flex-start' || ai === 'start' || ai === 'left') return 'left';
+          }
+        }
+      }
+      if (parent === msgEl) break;
+    }
+
+    if (msgRect.width > 0) {
+      const bubbleRect = bubble.getBoundingClientRect();
+      if (bubbleRect.width > 0 && msgRect.width - bubbleRect.width >= 20) {
+        const leftGap = bubbleRect.left - msgRect.left;
+        const rightGap = msgRect.right - bubbleRect.right;
+        if (leftGap > 48 && rightGap <= 28 && leftGap - rightGap >= 20) return 'right';
+        if (rightGap > 48 && leftGap <= 56 && rightGap - leftGap >= 16) return 'left';
+      }
+    }
+    return '';
+  }
+
+  function getDomMessageSender(msgEl) {
+    if (!msgEl) return {};
+    const exclude = 'a[href*="/post/"], [data-tcf-bar="1"], div[role="gridcell"]';
+
+    // 1. 對方頭像連結（自己傳的訊息不會顯示自己的頭像連結）
+    for (const a of msgEl.querySelectorAll('a[href*="/@"]')) {
+      if (a.closest(exclude)) continue;
+      const username = extractUsernameFromHref(a.getAttribute('href') || '');
+      if (username) {
+        return { sentByViewer: false, sender: username, senderSource: 'dom' };
+      }
+    }
+
+    // 2. 左側對方頭像圖片（排除貼文卡片與表情列）
+    const msgRect = msgEl.getBoundingClientRect();
+    for (const img of msgEl.querySelectorAll('img')) {
+      if (img.closest(exclude)) continue;
+      const alt = img.getAttribute('alt') || '';
+      const looksLikeAvatar =
+        isAvatarUrl(img.currentSrc || img.src) || /大頭貼照|profile picture|avatar/i.test(alt);
+      if (!looksLikeAvatar) continue;
+      const rect = img.getBoundingClientRect();
+      const smallAvatar = rect.width > 0 && rect.width <= 56 && rect.height <= 56;
+      const onLeftSide = msgRect.width === 0 || rect.left - msgRect.left < msgRect.width * 0.35;
+      if (smallAvatar && onLeftSide) {
+        const sender = extractNameFromAvatarAlt(alt) || getChatPartnerName();
+        return { sentByViewer: false, sender, senderSource: 'dom' };
+      }
+    }
+
+    // 3. 依訊息氣泡左右對齊判定（右 = 自己、左 = 對方）
+    const align = detectMessageHorizontalAlign(msgEl);
+    if (align === 'right') {
+      return { sentByViewer: true, sender: '你自己', senderSource: 'dom' };
+    }
+    if (align === 'left') {
+      return { sentByViewer: false, sender: getChatPartnerName(), senderSource: 'dom' };
+    }
+    return {};
+  }
+
+  function hasDomReaction(msgEl, emoji) {
+    const target = normalizeEmoji(emoji);
+    if (!target || !msgEl) return false;
+    return detectNativeReactions(msgEl).some((reaction) => normalizeEmoji(reaction) === target);
   }
 
   function getFollowingMessageText(data) {
@@ -1581,7 +1724,10 @@
 
     const nativeData = getNativeMessageData(msgEl, messageId);
     prioritizeSharedReply(posts, nativeData);
-    const senderInfo = getNativeMessageSender(nativeData);
+    const nativeSender = getNativeMessageSender(nativeData);
+    const senderInfo = typeof nativeSender.sentByViewer === 'boolean'
+      ? nativeSender
+      : getDomMessageSender(msgEl);
     const repliedToMessageId = nativeData?.source.get(nativeData.message.replied_to_message?.__ref)?.message_id;
     const ownReaction = posts.length ? getOwnNativeReaction(nativeData) : undefined;
     // 一般文字（排除貼文卡片內的文字）
@@ -3247,10 +3393,54 @@
     return waitForElement(() => grid.querySelector(selector), 500, 30);
   }
 
+  async function findMessageElementByScroll(grid, card, active) {
+    const selector = `div[data-message-id="${CSS.escape(card.messageId)}"]`;
+    const existing = grid.querySelector(selector);
+    if (existing) return existing;
+
+    if (typeof card.bottomOffset === 'number' && Number.isFinite(card.bottomOffset)) {
+      const approxTop = Math.max(0, grid.scrollHeight - card.bottomOffset - grid.clientHeight / 3);
+      grid.scrollTop = approxTop;
+      grid.dispatchEvent(new Event('scroll', { bubbles: true }));
+      const hit = await waitForElement(() => !active() || grid.querySelector(selector), 350, 35);
+      if (!active()) return null;
+      if (hit instanceof Element) return hit;
+    }
+
+    const step = Math.max(1, Math.floor(grid.clientHeight * 0.85));
+    let from = Math.max(0, grid.scrollHeight - grid.clientHeight);
+    for (let page = 0; page <= 5 && active(); page++) {
+      for (let pos = from; active(); pos = Math.max(0, pos - step)) {
+        grid.scrollTop = pos;
+        grid.dispatchEvent(new Event('scroll', { bubbles: true }));
+        await sleep(75);
+        if (!active()) return null;
+        const found = grid.querySelector(selector);
+        if (found) return found;
+        if (pos === 0) break;
+      }
+      if (!active() || page === 5) break;
+      const height = grid.scrollHeight;
+      grid.scrollTop = 0;
+      grid.dispatchEvent(new Event('scroll', { bubbles: true }));
+      const grew = await waitForElement(() => !active() || grid.scrollHeight > height + 40, 2500, 70);
+      if (!active() || !grew) break;
+      from = Math.min(grid.scrollHeight - grid.clientHeight, grid.scrollHeight - height);
+    }
+    return null;
+  }
+
   async function findAnkiMessageInHistory(card, active) {
     const grid = getMessageGrid();
     if (!grid || !active()) return null;
+    const selector = `div[data-message-id="${CSS.escape(card.messageId)}"]`;
+    const existing = grid.querySelector(selector);
+    if (existing) return existing;
+
     let list = getNativeHistoryList(grid);
+    if (!list) {
+      return findMessageElementByScroll(grid, card, active);
+    }
     for (let page = 1; list?.hasPrevious && page <= 40 && active(); page++) {
       if (list.items.some((item) => item.as_micg_interface?.message_id === card.messageId)) break;
       const oldest = Number(list.items[0]?.as_micg_interface?.timestamp_ms);
@@ -3301,7 +3491,7 @@
     const grid = getMessageGrid();
     const data = getNativeMessageData(msgEl, messageId);
     const list = grid && getNativeHistoryList(grid);
-    if (!data || !list) throw new Error('無法確認目前的回覆對象');
+    const hasNative = Boolean(data && list);
     // 1. 掛載原生 hover gridcell 並點擊第 2 顆按鈕（無 aria-haspopup 的回覆鈕）
     const findReplyBtn = () => {
       const gc = msgEl.querySelector('div[role="gridcell"]');
@@ -3349,7 +3539,9 @@
     await sleep(120);
 
     // 3. 送出（派發 Enter 鍵）
-    const previousIds = new Set(list.items.map((item) => item.as_micg_interface?.message_id));
+    const previousIds = hasNative
+      ? new Set(list.items.map((item) => item.as_micg_interface?.message_id))
+      : new Set(Array.from(grid?.querySelectorAll('div[data-message-id^="mid."]') || [], (el) => el.getAttribute('data-message-id')));
     const enterOpts = {
       key: 'Enter',
       code: 'Enter',
@@ -3361,16 +3553,25 @@
     textbox.dispatchEvent(new KeyboardEvent('keydown', enterOpts));
     textbox.dispatchEvent(new KeyboardEvent('keypress', enterOpts));
     textbox.dispatchEvent(new KeyboardEvent('keyup', enterOpts));
-    const confirmed = await waitForElement(() => getNativeHistoryList(grid)?.items.some((item) => {
-      const msg = item.as_micg_interface;
-      if (!msg?.message_id || previousIds.has(msg.message_id)) return false;
-      const native = data.source.get(data.source.get(item.__id)?.as_micg_interface?.__ref);
-      const user = data.source.get(native?.sender?.__ref);
-      if (user?.igid !== data.viewerIgId) return false;
-      const target = data.source.get(native?.replied_to_message?.__ref)?.message_id;
-      const content = data.source.get(native?.content?.__ref)?.text_body;
-      return target === messageId && content?.trim() === replyText;
-    }), 4000, 80);
+    const confirmed = hasNative
+      ? await waitForElement(() => getNativeHistoryList(grid)?.items.some((item) => {
+          const msg = item.as_micg_interface;
+          if (!msg?.message_id || previousIds.has(msg.message_id)) return false;
+          const native = data.source.get(data.source.get(item.__id)?.as_micg_interface?.__ref);
+          const user = data.source.get(native?.sender?.__ref);
+          if (user?.igid !== data.viewerIgId) return false;
+          const target = data.source.get(native?.replied_to_message?.__ref)?.message_id;
+          const content = data.source.get(native?.content?.__ref)?.text_body;
+          return target === messageId && content?.trim() === replyText;
+        }), 4000, 80)
+      : await waitForElement(() => {
+          const msgs = Array.from(grid?.querySelectorAll('div[data-message-id^="mid."]') || []);
+          const matchedNew = msgs.some((el) => {
+            const mid = el.getAttribute('data-message-id');
+            return mid && !previousIds.has(mid) && (el.textContent || '').includes(replyText);
+          });
+          return matchedNew || !(textbox.textContent || '').trim();
+        }, 4000, 80);
     if (!confirmed) throw new Error('Threads 尚未顯示這則引用回覆');
   }
 
@@ -3393,14 +3594,20 @@
           const msgEl = await findAnkiMessageInHistory(job.card, () => state.currentThreadId === job.card.threadId);
           if (!msgEl) throw new Error('找不到訊息位置');
           if (job.type === 'emoji') {
-            const alreadyApplied = hasOwnNativeReaction(msgEl, job.card.messageId, job.emoji);
+            const nativeApplied = hasOwnNativeReaction(msgEl, job.card.messageId, job.emoji);
+            const useDomFallback = nativeApplied === undefined;
+            const alreadyApplied = useDomFallback ? hasDomReaction(msgEl, job.emoji) : nativeApplied;
             if (alreadyApplied) duplicateCount++;
-            if (alreadyApplied === undefined) throw new Error('無法確認目前的表情');
             if (!alreadyApplied) {
               const result = await triggerQuickReaction(msgEl, job.emoji, false);
               if (!result?.ok) throw new Error(result?.reason || '未成功觸發');
-              const confirmed = await waitForElement(() => hasOwnNativeReaction(msgEl, job.card.messageId, job.emoji),
-                2500, 60);
+              const confirmed = await waitForElement(
+                () => (useDomFallback
+                  ? hasDomReaction(msgEl, job.emoji)
+                  : hasOwnNativeReaction(msgEl, job.card.messageId, job.emoji)),
+                2500,
+                60
+              );
               if (!confirmed) throw new Error('Threads 尚未顯示這個表情');
             }
             job.card.ownReaction = job.emoji;
@@ -3508,16 +3715,20 @@
     let oldest = Infinity;
     let posts = 0;
     let senderKnown = 0;
-    let messageData = 0;
+    let nativeSender = 0;
+    let domSender = 0;
     let from = Math.max(0, grid.scrollHeight - grid.clientHeight);
     const step = Math.max(1, Math.floor(grid.clientHeight * 0.85));
-    const scan = () => scanVisibleMessages(seen, cutoff, (record, element) => {
+    const scan = () => scanVisibleMessages(seen, cutoff, (record) => {
       const time = record.sentAt || Date.parse(record.timestamp);
       if (time) oldest = Math.min(oldest, time);
       if (!record.hasPost || (cutoff && time && time < cutoff)) return;
       posts++;
-      if (getReactFiber(element)) messageData++;
-      if (typeof record.sentByViewer === 'boolean') senderKnown++;
+      if (typeof record.sentByViewer === 'boolean') {
+        senderKnown++;
+        if (record.senderSource === 'native') nativeSender++;
+        else if (record.senderSource === 'dom') domSender++;
+      }
     });
     let failure = '';
     let complete = false;
@@ -3555,7 +3766,7 @@
       from = Math.min(grid.scrollHeight - grid.clientHeight, grid.scrollHeight - height);
     }
     const summary = posts
-      ? `掃到 ${posts} 則轉發，${senderKnown} 則確認發送者（原生訊息可讀 ${messageData} 則）`
+      ? `掃到 ${posts} 則轉發，${senderKnown} 則確認發送者（原生 ${nativeSender} / 畫面 ${domSender}）`
       : '目前尚未掃到轉發貼文';
     const status = !active() ? '已停止撈取' : failure || (complete ? '撈取完成' : '尚未確認涵蓋近七天');
     return `${status}。${summary}`;
