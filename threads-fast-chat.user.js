@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.24
+// @version      0.5.25
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -20,6 +20,7 @@
   'use strict';
 
   // ==================== 設定區 ====================
+  const SCRIPT_VERSION = '0.5.25';
   const DEFAULT_EMOJIS = ['❤️', '🤣', '🔥', '👀', '🫠', '👍'];
   const STORAGE_KEYS = {
     fastMode: 'tcf_fast_mode',
@@ -2905,6 +2906,7 @@
           <div class="tcf-anki-title">
             <span>🃏 Anki 刷貼文模式</span>
             <span id="tcf-anki-counter" class="tcf-anki-badge">0 / 0</span>
+            <span class="tcf-anki-badge" style="opacity:0.7;font-weight:500;">v${SCRIPT_VERSION}</span>
           </div>
           <div class="tcf-anki-top-actions">
             <button id="tcf-anki-scan-7d" class="tcf-anki-btn" type="button" title="自動持續往前掃描直到抓滿近 7 天內所有未處理貼文（可隨時停止）">📅 撈近 7 天</button>
@@ -3114,7 +3116,7 @@
         if (!ankiState.onlyUnhandled) return true;
         if (handledThisRound.has(r.messageId)) return true;
         if (ankiState.handledIds.has(r.messageId)) return false;
-        const reacted = r.ownReaction !== undefined ? Boolean(r.ownReaction) : Boolean(r.hasReaction);
+        const reacted = Boolean(r.ownReaction || r.hasReaction || r.reactions?.length);
         return !reacted && !r.repliedByMe;
       })
       .sort((a, b) => messageTime(b) - messageTime(a));
