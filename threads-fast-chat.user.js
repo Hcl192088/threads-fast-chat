@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.19
+// @version      0.5.20
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -3500,6 +3500,7 @@
 
   let stop7dScan = false;
   let isLocatingAnkiMessage = false;
+  let queuedAnkiPages = 0;
 
   async function scanAnkiHistory({ days, pages = 40 }) {
     if (ankiState.isScanning || isLocatingAnkiMessage) {
@@ -3507,7 +3508,11 @@
       return;
     }
     const grid = getMessageGrid();
-    if (!grid || !ankiState.open) return;
+    if (!ankiState.open) return;
+    if (!grid) {
+      setAnkiStatus('撈取停止：找不到 Threads 的聊天室列表');
+      return;
+    }
     const threadId = state.currentThreadId;
     const active = () => ankiState.open && state.currentThreadId === threadId && !stop7dScan;
     const button = document.getElementById('tcf-anki-scan-7d');
@@ -3523,20 +3528,29 @@
 
     let page = 0;
     let complete = false;
+    let failure = '';
     let upperBoundary;
     try {
       while (active()) {
         while ((state.isPreloading || isDrainingAnkiQueue) && active()) await sleep(50);
         if (!active()) break;
         const list = getNativeHistoryList(grid);
-        if (!list?.items.length) break;
+        if (!list?.items.length) {
+          failure = !getReactFiber(grid)
+            ? '撈取停止：腳本讀不到 Threads 的原生頁面資料'
+            : '撈取停止：讀不到 Threads 的原生歷史列表';
+          break;
+        }
         const items = list.items.map((item) => item.as_micg_interface);
         const first = items.findIndex((item) => Number(item?.timestamp_ms) >= cutoff);
         const end = upperBoundary ? items.findIndex((item) => item?.message_id === upperBoundary) : items.length;
         if (first >= 0 && end > first) {
           const topSlot = findMessageSlot(grid, items[first].message_id);
           const bottomSlot = findMessageSlot(grid, items[end - 1].message_id);
-          if (!topSlot || !bottomSlot) break;
+          if (!topSlot || !bottomSlot) {
+            failure = '撈取停止：找不到這段歷史紀錄的訊息列';
+            break;
+          }
           const gridTop = grid.getBoundingClientRect().top;
           const to = Math.max(0, grid.scrollTop + topSlot.getBoundingClientRect().top - gridTop);
           const from = Math.min(grid.scrollHeight - grid.clientHeight,
@@ -3568,7 +3582,10 @@
         upperBoundary = items[0]?.message_id;
         setAnkiStatus(`背景載入聊天紀錄（第 ${++page} 頁）…`);
         const older = await loadOlderAnkiPage(grid, active);
-        if (!older) break;
+        if (!older) {
+          if (active()) failure = '撈取停止：Threads 未回傳下一批舊訊息';
+          break;
+        }
         if (older.items[0]?.as_micg_interface?.message_id === upperBoundary && !older.hasPrevious) {
           complete = true;
           break;
@@ -3584,12 +3601,16 @@
       if (!isLocatingAnkiMessage) stop7dScan = false;
       if (button && !isLocatingAnkiMessage) button.textContent = '📅 撈近 7 天';
       await flushPendingMessageRecords();
+      const nextPages = queuedAnkiPages;
+      queuedAnkiPages = 0;
       if (ankiState.open && state.currentThreadId === threadId && !isLocatingAnkiMessage) {
         await rebuildAnkiDeck(false, false);
-        if (!isDrainingAnkiQueue) {
+        if (nextPages) {
+          scanOlderForAnki(nextPages);
+        } else if (!isDrainingAnkiQueue) {
           setAnkiStatus(cancelled ? '已停止撈取，已抓到的卡片可以繼續刷'
             : complete ? '背景撈取完成'
-            : '背景撈取尚未完成，可再按「撈近 7 天」繼續');
+            : failure || '背景撈取尚未完成，可再按「撈近 7 天」繼續');
         }
       }
     }
@@ -3600,7 +3621,17 @@
   }
 
   function scanOlderForAnki(pages = 5) {
-    if (!ankiState.isScanning && !isLocatingAnkiMessage) return scanAnkiHistory({ pages });
+    if (isLocatingAnkiMessage) {
+      setAnkiStatus('定位中，請等目前定位完成');
+      return;
+    }
+    if (ankiState.isScanning) {
+      queuedAnkiPages = pages;
+      stop7dScan = true;
+      setAnkiStatus(`正在切換為往前撈 ${pages} 頁…`);
+      return;
+    }
+    return scanAnkiHistory({ pages });
   }
 
   async function openAnkiMode() {
