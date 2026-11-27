@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.20
+// @version      0.5.21
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -1652,7 +1652,7 @@
     }, 350);
   }
 
-  function scanVisibleMessages(seen = seenInSession, cutoff = 0) {
+  function scanVisibleMessages(seen = seenInSession, cutoff = 0, onRecord) {
     const threadId = state.currentThreadId;
     if (!threadId) return;
     const grid = getMessageGrid();
@@ -1668,9 +1668,11 @@
       const cacheKey = `${threadId}::${mid}`;
       if (!seen.has(cacheKey)) {
         const rec = extractMessageRecord(msgEl, threadId);
-        if (rec && (!cutoff || messageTime(rec) >= cutoff)) {
+        if (!rec) return;
+        onRecord?.(rec, msgEl);
+        seen.add(cacheKey);
+        if (!cutoff || messageTime(rec) >= cutoff) {
           seenInSession.add(cacheKey);
-          seen.add(cacheKey);
           pendingRecords.push(rec);
           scheduleFlushCache();
         }
@@ -3021,7 +3023,7 @@
       updateAnkiProgress(0, 0);
       cardEl.innerHTML = `
         <div class="tcf-empty">
-          🎉 目前沒有待處理的未反應貼文了！<br><br>
+          這台裝置目前還沒有待刷字卡。<br><br>
           點上方 <strong>「⚡ 往前撈 5 頁」</strong> 可以繼續往更舊的聊天紀錄裡抓出還沒按過表情的貼文，<br>
            或切換 <strong>「全部貼文」</strong> 瀏覽收到的貼文。
         </div>`;
@@ -3502,6 +3504,63 @@
   let isLocatingAnkiMessage = false;
   let queuedAnkiPages = 0;
 
+  async function scanIPhoneAnkiHistory(grid, { cutoff, pages, active, seen }) {
+    let oldest = Infinity;
+    let posts = 0;
+    let senderKnown = 0;
+    let messageData = 0;
+    let from = Math.max(0, grid.scrollHeight - grid.clientHeight);
+    const step = Math.max(1, Math.floor(grid.clientHeight * 0.85));
+    const scan = () => scanVisibleMessages(seen, cutoff, (record, element) => {
+      const time = record.sentAt || Date.parse(record.timestamp);
+      if (time) oldest = Math.min(oldest, time);
+      if (!record.hasPost || (cutoff && time && time < cutoff)) return;
+      posts++;
+      if (getReactFiber(element)) messageData++;
+      if (typeof record.sentByViewer === 'boolean') senderKnown++;
+    });
+    let failure = '';
+    let complete = false;
+    for (let page = 0; active(); page++) {
+      let batch = 0;
+      for (let pos = from; active(); pos = Math.max(0, pos - step)) {
+        while ((state.isPreloading || isDrainingAnkiQueue) && active()) await sleep(50);
+        if (!active()) break;
+        grid.scrollTop = pos;
+        await sleep(90);
+        if (!active()) break;
+        scan();
+        if (++batch % 4 === 0 || pos === 0 || oldest <= cutoff) {
+          await flushPendingMessageRecords();
+          if (active()) await rebuildAnkiDeck(false, false);
+        }
+        if (pos === 0 || oldest <= cutoff) break;
+      }
+      if (!active()) break;
+      if (oldest <= cutoff || (!cutoff && page >= pages)) {
+        complete = true;
+        break;
+      }
+      if (page >= pages) break;
+      setAnkiStatus(`iPhone 往前載入（第 ${page + 1} 頁）…`);
+      const height = grid.scrollHeight;
+      grid.scrollTop = 0;
+      grid.dispatchEvent(new Event('scroll', { bubbles: true }));
+      const grew = await waitForElement(() => !active() || grid.scrollHeight > height + 40, 3500, 70);
+      if (!active()) break;
+      if (!grew) {
+        failure = 'Threads 未再載入更舊的訊息';
+        break;
+      }
+      from = Math.min(grid.scrollHeight - grid.clientHeight, grid.scrollHeight - height);
+    }
+    const summary = posts
+      ? `掃到 ${posts} 則轉發，${senderKnown} 則確認發送者（原生訊息可讀 ${messageData} 則）`
+      : '目前尚未掃到轉發貼文';
+    const status = !active() ? '已停止撈取' : failure || (complete ? '撈取完成' : '尚未確認涵蓋近七天');
+    return `${status}。${summary}`;
+  }
+
   async function scanAnkiHistory({ days, pages = 40 }) {
     if (ankiState.isScanning || isLocatingAnkiMessage) {
       stop7dScan = true;
@@ -3529,9 +3588,14 @@
     let page = 0;
     let complete = false;
     let failure = '';
+    let iPhoneStatus = '';
     let upperBoundary;
+    const scrollHistoryOnIPhone = /iPhone|iPod/.test(navigator.userAgent);
     try {
-      while (active()) {
+      if (scrollHistoryOnIPhone) {
+        iPhoneStatus = await scanIPhoneAnkiHistory(grid, { cutoff, pages, active, seen });
+      }
+      while (!scrollHistoryOnIPhone && active()) {
         while ((state.isPreloading || isDrainingAnkiQueue) && active()) await sleep(50);
         if (!active()) break;
         const list = getNativeHistoryList(grid);
@@ -3608,9 +3672,9 @@
         if (nextPages) {
           scanOlderForAnki(nextPages);
         } else if (!isDrainingAnkiQueue) {
-          setAnkiStatus(cancelled ? '已停止撈取，已抓到的卡片可以繼續刷'
+          setAnkiStatus(iPhoneStatus || (cancelled ? '已停止撈取，已抓到的卡片可以繼續刷'
             : complete ? '背景撈取完成'
-            : failure || '背景撈取尚未完成，可再按「撈近 7 天」繼續');
+            : failure || '背景撈取尚未完成，可再按「撈近 7 天」繼續'));
         }
       }
     }
