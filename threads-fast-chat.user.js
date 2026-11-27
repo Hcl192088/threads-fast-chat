@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.25
+// @version      0.5.26
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -20,7 +20,7 @@
   'use strict';
 
   // ==================== 設定區 ====================
-  const SCRIPT_VERSION = '0.5.25';
+  const SCRIPT_VERSION = '0.5.26';
   const DEFAULT_EMOJIS = ['❤️', '🤣', '🔥', '👀', '🫠', '👍'];
   const STORAGE_KEYS = {
     fastMode: 'tcf_fast_mode',
@@ -1690,20 +1690,139 @@
   }
 
   function prioritizeSharedReply(posts, data) {
-    if (posts.length < 2 || !data) return;
-    const content = data.source.get(data.message.content?.__ref);
-    const parent = data.source.get(content?.parent_post?.__ref);
-    if (!parent?.threads_post_json || !content.threads_post_json) return;
-    // Threads 先放原貼文的連結，但 threads_post_json 指向實際分享的留言。
-    try {
-      const replyCode = JSON.parse(content.threads_post_json).code;
-      if (!replyCode) return;
-      const replyIndex = posts.findIndex((post) => extractPostCode(post.url) === replyCode);
-      if (replyIndex > 0) posts.unshift(posts.splice(replyIndex, 1)[0]);
-      if (replyIndex >= 0) posts[0].sharedParent = summarizePostObj(JSON.parse(parent.threads_post_json));
-    } catch (error) {
-      console.warn('[ThreadsFastChat] shared reply JSON invalid:', error);
+    if (posts.length < 2) return;
+    if (data) {
+      const content = data.source.get(data.message.content?.__ref);
+      const parent = data.source.get(content?.parent_post?.__ref);
+      if (!parent?.threads_post_json || !content.threads_post_json) return;
+      // Threads 先放原貼文的連結，但 threads_post_json 指向實際分享的留言。
+      try {
+        const replyCode = JSON.parse(content.threads_post_json).code;
+        if (!replyCode) return;
+        const replyIndex = posts.findIndex((post) => extractPostCode(post.url) === replyCode);
+        if (replyIndex > 0) posts.unshift(posts.splice(replyIndex, 1)[0]);
+        if (replyIndex >= 0) posts[0].sharedParent = summarizePostObj(JSON.parse(parent.threads_post_json));
+      } catch (error) {
+        console.warn('[ThreadsFastChat] shared reply JSON invalid:', error);
+      }
+      return;
     }
+    // DOM 備援（iPhone 隔離環境讀不到 nativeData）：
+    // Threads 分享留言時，DOM 依序先放原貼文連結 (posts[0])，再放實際分享的留言連結 (posts[1])。
+    const parentPost = posts[0];
+    const replyPost = posts[1];
+    const parentCode = extractPostCode(parentPost.url);
+    const replyCode = extractPostCode(replyPost.url);
+    if (!parentCode || !replyCode || parentCode === replyCode) return;
+    posts.unshift(posts.splice(1, 1)[0]);
+    posts[0].sharedParent = {
+      code: parentCode,
+      author: parentPost.author || 'Threads 貼文',
+      avatar: '',
+      text: parentPost.excerpt || '',
+      media: parentPost.imgUrl ? [{ type: 'image', url: parentPost.imgUrl }] : [],
+    };
+  }
+
+  function getDomFollowingMessageText(msgEl, senderInfo, grid) {
+    if (!msgEl || !grid || typeof senderInfo?.sentByViewer !== 'boolean') return '';
+    const msgs = Array.from(grid.querySelectorAll('div[data-message-id^="mid."]'));
+    const idx = msgs.indexOf(msgEl);
+    if (idx < 0 || idx + 1 >= msgs.length) return '';
+    const nextEl = msgs[idx + 1];
+    if (!nextEl || nextEl.querySelector('a[href*="/post/"]')) return '';
+    const rawNext = (nextEl.textContent || '').trim();
+    if (/已回覆|回覆了|replied/i.test(rawNext)) return '';
+    const nextSender = getDomMessageSender(nextEl);
+    if (nextSender.sentByViewer !== senderInfo.sentByViewer) return '';
+    const parts = [];
+    nextEl.querySelectorAll('span[dir="auto"]').forEach((span) => {
+      if (span.closest('[data-tcf-bar="1"], div[role="gridcell"]')) return;
+      const t = span.textContent.trim();
+      if (t) parts.push(t);
+    });
+    return parts.join('\n').trim().slice(0, 500);
+  }
+
+  function parseThreadTimeLabel(raw, now = new Date()) {
+    const s = (raw || '').replace(/\s+/g, ' ').trim();
+    if (!s || s.length > 42) return NaN;
+
+    const parseClock = (str) => {
+      const m = str.match(/(上午|下午|凌晨|中午|晚上|早上)?\s*(\d{1,2}):(\d{2})(?:\s*(AM|PM))?/i);
+      if (!m) return null;
+      let h = Number(m[2]);
+      const min = Number(m[3]);
+      if (h > 23 || min > 59) return null;
+      const zhP = m[1] || '';
+      const enP = (m[4] || '').toUpperCase();
+      if ((zhP === '下午' || zhP === '晚上' || enP === 'PM') && h < 12) h += 12;
+      if ((zhP === '凌晨' || zhP === '上午' || enP === 'AM') && h === 12) h = 0;
+      return [h, min];
+    };
+
+    const clock = parseClock(s);
+    const makeDate = (y, m, d, c = clock) => new Date(y, m, d, c ? c[0] : 12, c ? c[1] : 0, 0, 0).getTime();
+
+    // 2026年11月25日 / 2026/11/25 / 2026-11-25
+    const ymd = s.match(/(\d{4})\s*[年/\-.]\s*(\d{1,2})\s*[月/\-.]\s*(\d{1,2})/);
+    if (ymd) return makeDate(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]));
+
+    // 11月25日
+    const md = s.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+    if (md) {
+      let ts = makeDate(now.getFullYear(), Number(md[1]) - 1, Number(md[2]));
+      if (ts > now.getTime() + DAY_MS) ts = makeDate(now.getFullYear() - 1, Number(md[1]) - 1, Number(md[2]));
+      return ts;
+    }
+
+    // 今天 / 昨天 / 前天 / Today / Yesterday
+    if (/今天|Today/i.test(s)) return makeDate(now.getFullYear(), now.getMonth(), now.getDate());
+    if (/昨天|Yesterday/i.test(s)) return makeDate(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+    if (/前天/.test(s)) return makeDate(now.getFullYear(), now.getMonth(), now.getDate() - 2);
+
+    // 星期X / 週X / Mon..Sun
+    const zhDay = s.match(/(?:星期|週|周)([日天一二三四五六])/);
+    const enDay = s.match(/\b(Sun|Mon|Tue|Wed|Thu|Fri|Sat)[a-z]*\b/i);
+    if (zhDay || enDay) {
+      const targetDow = zhDay
+        ? { 日: 0, 天: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6 }[zhDay[1]]
+        : ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(enDay[1].toLowerCase().slice(0, 3));
+      if (targetDow >= 0) {
+        let diff = (now.getDay() - targetDow + 7) % 7;
+        if (diff === 0) diff = 7;
+        return makeDate(now.getFullYear(), now.getMonth(), now.getDate() - diff);
+      }
+    }
+
+    // 純時間（例如 20:15 / 下午 8:15）視為今天
+    if (clock && s.length <= 16) {
+      return makeDate(now.getFullYear(), now.getMonth(), now.getDate());
+    }
+    return NaN;
+  }
+
+  function getDomMessageTimestamp(msgEl, grid) {
+    if (!msgEl || !grid) return undefined;
+    // 從 msgEl 所屬的虛擬列往上/往前找最近一個不含 data-message-id 的時間分隔列
+    let row = msgEl;
+    while (row.parentElement && row.parentElement !== grid && !row.hasAttribute('data-virtualized')) {
+      row = row.parentElement;
+    }
+    for (let prev = row.previousElementSibling, hops = 0; prev && hops < 25; prev = prev.previousElementSibling, hops++) {
+      if (prev.querySelector('div[data-message-id^="mid."]')) continue;
+      const t = prev.querySelector('time');
+      if (t) {
+        const parsed = Date.parse(t.getAttribute('datetime') || '') || parseThreadTimeLabel(t.textContent);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+      const text = (prev.textContent || '').trim();
+      if (text && text.length <= 42) {
+        const parsed = parseThreadTimeLabel(text);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+    }
+    return undefined;
   }
 
   function extractMessageRecord(msgEl, threadId) {
@@ -1774,13 +1893,23 @@
 
     if (!text && !posts.length) return null;
 
+    const followingText = posts.length
+      ? (nativeData ? getFollowingMessageText(nativeData) : getDomFollowingMessageText(msgEl, senderInfo, grid))
+      : '';
+    const domSentAt = nativeData ? undefined : getDomMessageTimestamp(msgEl, grid);
+    const baseSentAt = Number(nativeData?.item.as_micg_interface.timestamp_ms) || Date.parse(timestamp) || domSentAt;
+    // 同時間分隔線下用 bottomOffset 微調毫秒差，確保由新到舊排序穩定
+    const sentAt = Number.isFinite(baseSentAt)
+      ? (domSentAt && bottomOffset != null ? Math.max(1, baseSentAt - Math.min(bottomOffset, 59_000)) : baseSentAt)
+      : undefined;
+
     return {
       key: `${threadId}::${messageId}`,
       threadId,
       messageId,
       ...senderInfo,
       text,
-      followingText: posts.length ? getFollowingMessageText(nativeData) : '',
+      followingText,
       posts,
       hasPost: posts.length > 0,
       reactions,
@@ -1789,9 +1918,10 @@
       ...(ownReaction?.reaction_timestamp_ms ? { processedAt: Number(ownReaction.reaction_timestamp_ms) } : {}),
       repliedToMessageId,
       isReplyMessage,
+      ...(isReplyMessage && senderInfo.sentByViewer && !repliedToMessageId ? { replyRawText: rawMsgText.slice(0, 300) } : {}),
       bottomOffset,
       timestamp,
-      sentAt: Number(nativeData?.item.as_micg_interface.timestamp_ms) || Date.parse(timestamp) || undefined,
+      sentAt,
       capturedAt: Date.now(),
     };
   }
@@ -3081,13 +3211,36 @@
 
     const cachedRows = await getThreadMessages(threadId);
     const repliedIds = new Map();
+    const domReplyTexts = [];
     for (const row of cachedRows) {
       if (row.sentByViewer && row.repliedToMessageId) {
         const time = messageTime(row);
         repliedIds.set(row.repliedToMessageId, Math.min(time, repliedIds.get(row.repliedToMessageId) || time));
+      } else if (row.sentByViewer && row.isReplyMessage && row.replyRawText) {
+        domReplyTexts.push({ raw: row.replyRawText, time: messageTime(row) });
       }
     }
-    const newlyReplied = cachedRows.filter((row) => row.posts?.length && !row.repliedByMe && repliedIds.has(row.messageId));
+    const matchDomReplyTime = (row) => {
+      if (!domReplyTexts.length) return 0;
+      const needles = [row.posts?.[0]?.excerpt, row.text]
+        .map((s) => (s || '').trim().slice(0, 40))
+        .filter((s) => s.length >= 10);
+      if (!needles.length) return 0;
+      for (const rep of domReplyTexts) {
+        if (needles.some((needle) => rep.raw.includes(needle))) return rep.time || Date.now();
+      }
+      return 0;
+    };
+    const newlyReplied = cachedRows.filter((row) => {
+      if (!row.posts?.length || row.repliedByMe) return false;
+      if (repliedIds.has(row.messageId)) return true;
+      const domTime = matchDomReplyTime(row);
+      if (domTime) {
+        repliedIds.set(row.messageId, domTime);
+        return true;
+      }
+      return false;
+    });
     for (const row of newlyReplied) {
       row.repliedByMe = true;
       row.processedAt ||= repliedIds.get(row.messageId) || Date.now();
@@ -3232,10 +3385,13 @@
           </div>
           ${url ? `<a class="tcf-anki-btn" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">${linkLabel}</a>` : ''}
         </div>`;
+      const parentAuthor = parentPreview?.author || sharedParent?.author || 'Threads 貼文';
+      const parentAvatar = parentPreview?.avatar || sharedParent?.avatar || '';
+      const parentText = parentPreview?.text || sharedParent?.text || '';
       const parentHtml = sharedParent ? `
         <h3>原貼文</h3>
-        ${renderPostHeader(sharedParent.author, sharedParent.avatar, parentUrl, '↗ 開啟原貼文')}
-        ${sharedParent.text ? `<div class="tcf-anki-text">${escapeHtml(sharedParent.text)}</div>` : ''}
+        ${renderPostHeader(parentAuthor, parentAvatar, parentUrl, '↗ 開啟原貼文')}
+        ${parentText ? `<div class="tcf-anki-text">${escapeHtml(parentText)}</div>` : ''}
         ${renderMediaBlock(parentPreview ? parentPreview.media : sharedParent.media)}
         ${parentUrl && !parentPreview && !parentLoading ? '<div class="tcf-pv-loading">未取得原貼文的完整媒體</div>' : ''}
       ` : '';
@@ -3430,7 +3586,8 @@
 
     const step = Math.max(1, Math.floor(grid.clientHeight * 0.85));
     let from = Math.max(0, grid.scrollHeight - grid.clientHeight);
-    for (let page = 0; page <= 5 && active(); page++) {
+    const maxPages = 25;
+    for (let page = 0; page <= maxPages && active(); page++) {
       for (let pos = from; active(); pos = Math.max(0, pos - step)) {
         grid.scrollTop = pos;
         grid.dispatchEvent(new Event('scroll', { bubbles: true }));
@@ -3440,11 +3597,19 @@
         if (found) return found;
         if (pos === 0) break;
       }
-      if (!active() || page === 5) break;
+      if (!active() || page === maxPages) break;
+      setAnkiStatus(`往前找原始訊息（第 ${page + 1} 頁）…`);
       const height = grid.scrollHeight;
       grid.scrollTop = 0;
       grid.dispatchEvent(new Event('scroll', { bubbles: true }));
-      const grew = await waitForElement(() => !active() || grid.scrollHeight > height + 40, 2500, 70);
+      let grew = await waitForElement(() => !active() || grid.scrollHeight > height + 40, 3500, 70);
+      if (active() && !grew) {
+        grid.scrollTop = 12;
+        await sleep(60);
+        grid.scrollTop = 0;
+        grid.dispatchEvent(new Event('scroll', { bubbles: true }));
+        grew = await waitForElement(() => !active() || grid.scrollHeight > height + 40, 2000, 70);
+      }
       if (!active() || !grew) break;
       from = Math.min(grid.scrollHeight - grid.clientHeight, grid.scrollHeight - height);
     }
