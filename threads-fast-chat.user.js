@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.26
+// @version      0.5.27
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -20,7 +20,7 @@
   'use strict';
 
   // ==================== 設定區 ====================
-  const SCRIPT_VERSION = '0.5.26';
+  const SCRIPT_VERSION = '0.5.27';
   const DEFAULT_EMOJIS = ['❤️', '🤣', '🔥', '👀', '🫠', '👍'];
   const STORAGE_KEYS = {
     fastMode: 'tcf_fast_mode',
@@ -3388,9 +3388,26 @@
       const parentAuthor = parentPreview?.author || sharedParent?.author || 'Threads 貼文';
       const parentAvatar = parentPreview?.avatar || sharedParent?.avatar || '';
       const parentText = parentPreview?.text || sharedParent?.text || '';
+      const rawAncestors = (parentPreview?.parentPosts?.length ? parentPreview.parentPosts : postData.parentPosts) || [];
+      const ancestors = sharedParent
+        ? rawAncestors.filter((pp) => !sharedParent.code || pp.code !== sharedParent.code)
+        : [];
+      const ancestorsHtml = ancestors.length
+        ? ancestors
+            .map(
+              (pp, pIdx) => `
+              <div class="tcf-pv-parent">
+                <div class="tcf-pv-parent-label">🧵 ${pIdx === 0 ? '原貼文' : '上層留言'} · ${escapeHtml(pp.author || '')}</div>
+                ${pp.text ? `<div class="tcf-anki-text" style="margin-top:4px;">${escapeHtml(pp.text)}</div>` : ''}
+                ${renderMediaBlock(pp.media, 'tcf-anki-media')}
+              </div>`
+            )
+            .join('')
+        : '';
       const parentHtml = sharedParent ? `
-        <h3>原貼文</h3>
-        ${renderPostHeader(parentAuthor, parentAvatar, parentUrl, '↗ 開啟原貼文')}
+        ${ancestorsHtml}
+        <h3>${ancestors.length ? '上層留言' : '原貼文'}</h3>
+        ${renderPostHeader(parentAuthor, parentAvatar, parentUrl, ancestors.length ? '↗ 開啟上層留言' : '↗ 開啟原貼文')}
         ${parentText ? `<div class="tcf-anki-text">${escapeHtml(parentText)}</div>` : ''}
         ${renderMediaBlock(parentPreview ? parentPreview.media : sharedParent.media)}
         ${parentUrl && !parentPreview && !parentLoading ? '<div class="tcf-pv-loading">未取得原貼文的完整媒體</div>' : ''}
