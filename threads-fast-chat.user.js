@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.27
+// @version      0.5.28
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -20,7 +20,7 @@
   'use strict';
 
   // ==================== 設定區 ====================
-  const SCRIPT_VERSION = '0.5.27';
+  const SCRIPT_VERSION = '0.5.28';
   const DEFAULT_EMOJIS = ['❤️', '🤣', '🔥', '👀', '🫠', '👍'];
   const STORAGE_KEYS = {
     fastMode: 'tcf_fast_mode',
@@ -3103,9 +3103,43 @@
       }
     }, { passive: true });
 
+    // 手機快速點擊輔助：直接用 touchend 響應（避免背景捲動時 iOS Safari 吃掉 click），電腦版照常走 click
+    const bindFastTap = (el, handler) => {
+      let sx = 0;
+      let sy = 0;
+      let handledTouchAt = 0;
+      el.addEventListener('touchstart', (e) => {
+        if (e.touches.length !== 1) return;
+        sx = e.touches[0].clientX;
+        sy = e.touches[0].clientY;
+      }, { passive: true });
+      el.addEventListener('touchend', (e) => {
+        if (!e.changedTouches.length) return;
+        const dx = Math.abs(e.changedTouches[0].clientX - sx);
+        const dy = Math.abs(e.changedTouches[0].clientY - sy);
+        if (dx < 14 && dy < 14) {
+          e.preventDefault();
+          e.stopPropagation();
+          handledTouchAt = Date.now();
+          handler();
+        }
+      }, { passive: false });
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (Date.now() - handledTouchAt < 450) return;
+        handler();
+      });
+    };
+
     document.getElementById('tcf-anki-close').addEventListener('click', closeAnkiMode);
-    document.getElementById('tcf-anki-prev').addEventListener('click', () => stepAnki(-1));
-    document.getElementById('tcf-anki-skip').addEventListener('click', () => stepAnki(1));
+    bindFastTap(document.getElementById('tcf-anki-prev'), () => {
+      markAnkiInteraction();
+      stepAnki(-1);
+    });
+    bindFastTap(document.getElementById('tcf-anki-skip'), () => {
+      markAnkiInteraction();
+      stepAnki(1);
+    });
     document.getElementById('tcf-anki-scan-7d').addEventListener('click', () => scanRecentDaysForAnki(7));
     document.getElementById('tcf-anki-scan').addEventListener('click', () => scanOlderForAnki(5));
 
@@ -3125,7 +3159,7 @@
       btn.className = 'tcf-anki-key-btn';
       btn.innerHTML = `<span class="tcf-anki-kbd">${idx + 1}</span><span>${emoji}</span>`;
       btn.title = `按鍵 ${idx + 1}：送出 ${emoji} 並跳下一張`;
-      btn.addEventListener('click', () => handleAnkiEmoji(emoji));
+      bindFastTap(btn, () => handleAnkiEmoji(emoji));
       emojiGroup.appendChild(btn);
     });
 
@@ -3606,6 +3640,8 @@
     const maxPages = 25;
     for (let page = 0; page <= maxPages && active(); page++) {
       for (let pos = from; active(); pos = Math.max(0, pos - step)) {
+        await waitForAnkiIdle(350);
+        if (!active()) return null;
         grid.scrollTop = pos;
         grid.dispatchEvent(new Event('scroll', { bubbles: true }));
         await sleep(75);
@@ -3778,10 +3814,26 @@
     if (!confirmed) throw new Error('Threads 尚未顯示這則引用回覆');
   }
 
-  // 背景串行送出佇列：Anki 按表情或回覆時 0ms 立刻翻卡，背景依序確實送出
+  // 背景串行送出佇列：Anki 按表情或回覆時 0ms 立刻翻卡，並在操作空檔自動背景依序送出
   const ankiSendQueue = [];
   const pendingAnkiReactions = new Set();
   let isDrainingAnkiQueue = false;
+  let lastAnkiInteractionAt = 0;
+
+  function markAnkiInteraction() {
+    lastAnkiInteractionAt = Date.now();
+  }
+
+  async function waitForAnkiIdle(minIdleMs = 450) {
+    // 關閉 Anki 或已刷到最後一張時不延遲，立刻全速送完
+    while (
+      ankiState.open &&
+      ankiState.index < ankiState.deck.length &&
+      Date.now() - lastAnkiInteractionAt < minIdleMs
+    ) {
+      await sleep(120);
+    }
+  }
 
   async function drainAnkiSendQueue() {
     if (isDrainingAnkiQueue || isLocatingAnkiMessage) return;
@@ -3791,6 +3843,10 @@
     let lastFailReason = '';
     try {
       while (ankiSendQueue.length) {
+        if (ankiState.open && ankiState.index < ankiState.deck.length && Date.now() - lastAnkiInteractionAt < 450) {
+          setAnkiStatus(`🕒 待送 ${ankiSendQueue.length} 筆（停頓時自動背景送出）…`);
+          await waitForAnkiIdle(450);
+        }
         const job = ankiSendQueue.shift();
         setAnkiStatus(`⚡ 背景送出 ${job.label}${ankiSendQueue.length ? ` (待送 ${ankiSendQueue.length})` : ''}...`);
         try {
@@ -3864,6 +3920,7 @@
     pendingAnkiReactions.add(reactionKey);
 
     // 樂觀標記並 0ms 瞬間翻下一張卡片，不讓使用者等待！
+    markAnkiInteraction();
     card.doneInSession = true;
 
     ankiSendQueue.push({ type: 'emoji', card, emoji, label: emoji, reactionKey });
@@ -3882,6 +3939,7 @@
 
     input.value = '';
     input.blur();
+    markAnkiInteraction();
     card.doneInSession = true;
 
     ankiSendQueue.push({ type: 'reply', card, text, label: '回覆' });
@@ -4117,7 +4175,11 @@
     ensureAnkiModalUI();
     ankiState.open = true;
     document.documentElement.classList.add('tcf-anki-open');
-    document.getElementById('tcf-anki-modal')?.classList.add('tcf-open');
+    const modal = document.getElementById('tcf-anki-modal');
+    if (modal) {
+      document.body.appendChild(modal);
+      modal.classList.add('tcf-open');
+    }
     const threadId = state.currentThreadId;
     const pruningKey = `tcf_anki_pruned::${threadId}`;
     const today = new Date().toLocaleDateString('sv-SE');
