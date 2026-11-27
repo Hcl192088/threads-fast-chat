@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.28
+// @version      0.5.29
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -20,7 +20,7 @@
   'use strict';
 
   // ==================== 設定區 ====================
-  const SCRIPT_VERSION = '0.5.28';
+  const SCRIPT_VERSION = '0.5.29';
   const DEFAULT_EMOJIS = ['❤️', '🤣', '🔥', '👀', '🫠', '👍'];
   const STORAGE_KEYS = {
     fastMode: 'tcf_fast_mode',
@@ -140,7 +140,7 @@
       position: fixed;
       top: 12px;
       right: 16px;
-      z-index: 99999;
+      z-index: 2147483630;
       display: flex;
       align-items: center;
       gap: 6px;
@@ -2295,13 +2295,41 @@
       `;
       document.body.appendChild(toolbar);
 
+      const bindToolbarTap = (el, handler) => {
+        let sx = 0;
+        let sy = 0;
+        let touchedAt = 0;
+        el.addEventListener('touchstart', (e) => {
+          e.stopPropagation();
+          if (e.touches.length !== 1) return;
+          sx = e.touches[0].clientX;
+          sy = e.touches[0].clientY;
+        }, { passive: true });
+        el.addEventListener('touchend', (e) => {
+          e.stopPropagation();
+          if (!e.changedTouches.length) return;
+          const dx = Math.abs(e.changedTouches[0].clientX - sx);
+          const dy = Math.abs(e.changedTouches[0].clientY - sy);
+          if (dx < 14 && dy < 14) {
+            e.preventDefault();
+            touchedAt = Date.now();
+            handler();
+          }
+        }, { passive: false });
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (Date.now() - touchedAt < 450) return;
+          handler();
+        });
+      };
+
       const collapseBtn = document.getElementById('tcf-btn-collapse');
-      collapseBtn.addEventListener('click', () => {
+      bindToolbarTap(collapseBtn, () => {
         const collapsed = toolbar.classList.toggle('tcf-collapsed');
         collapseBtn.textContent = collapsed ? '⚡' : '✕';
       });
 
-      document.getElementById('tcf-btn-anki').addEventListener('click', () => openAnkiMode());
+      bindToolbarTap(document.getElementById('tcf-btn-anki'), () => openAnkiMode());
       document.getElementById('tcf-btn-preload').addEventListener('click', () => preloadOlderMessages(5, false));
 
       const autoToggle = document.getElementById('tcf-btn-auto');
@@ -4230,8 +4258,9 @@
     );
     if (!ready || state.currentThreadId !== threadId || !state.autoPreload) return;
     autoPreloadedThreads.add(threadId);
-    await sleep(600);
-    if (state.currentThreadId === threadId && !state.isPreloading) {
+    // 手機剛開頁面時多等一下再自動預載，避免跟 Threads 首次渲染和點擊 ⚡ 搶主執行緒
+    await sleep('ontouchstart' in window ? 2500 : 600);
+    if (state.currentThreadId === threadId && !state.isPreloading && !ankiState.open) {
       preloadOlderMessages(5, true);
     }
   }
@@ -4250,15 +4279,14 @@
     applyGlobalFlags();
     refreshCacheCount();
 
-    // 觀察整個聊天室 DOM 變化（相容 Threads 虛擬化重繪；Anki 開啟或背景送出時暫停以免與翻卡搶主執行緒）
-    let scanQueued = false;
+    // 觀察整個聊天室 DOM 變化（350ms 節流，避免剛開頁面時每幀重掃卡住 ⚡ 點擊）
+    let scanTimer = null;
     state.gridObserver = new MutationObserver(() => {
-      if (scanQueued || ankiState.open || ankiState.isScanning || isDrainingAnkiQueue) return;
-      scanQueued = true;
-      requestAnimationFrame(() => {
-        scanQueued = false;
+      if (scanTimer || ankiState.open || ankiState.isScanning || isDrainingAnkiQueue) return;
+      scanTimer = setTimeout(() => {
+        scanTimer = null;
         if (!ankiState.open && !ankiState.isScanning && !isDrainingAnkiQueue) scanVisibleMessages();
-      });
+      }, 350);
     });
 
     state.gridObserver.observe(document.body, {
