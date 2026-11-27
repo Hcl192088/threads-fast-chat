@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.23
+// @version      0.5.24
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -1459,7 +1459,7 @@
   function detectNativeReactions(msgEl) {
     // 偵測原生表情徽章（排除我們注入的 [data-tcf-bar="1"] 與貼文連結與 hover gridcell）
     const reactions = [];
-    const btns = msgEl.querySelectorAll('div[role="button"][tabindex="0"]');
+    const btns = msgEl.querySelectorAll('[role="button"], button');
     for (const b of btns) {
       if (b.closest('[data-tcf-bar="1"]')) continue;
       if (b.closest('div[role="gridcell"]')) continue;
@@ -3114,7 +3114,8 @@
         if (!ankiState.onlyUnhandled) return true;
         if (handledThisRound.has(r.messageId)) return true;
         if (ankiState.handledIds.has(r.messageId)) return false;
-        return !r.ownReaction && !r.repliedByMe;
+        const reacted = r.ownReaction !== undefined ? Boolean(r.ownReaction) : Boolean(r.hasReaction);
+        return !reacted && !r.repliedByMe;
       })
       .sort((a, b) => messageTime(b) - messageTime(a));
 
@@ -3682,8 +3683,8 @@
     card.doneInSession = true;
 
     ankiSendQueue.push({ type: 'emoji', card, emoji, label: emoji, reactionKey });
-    drainAnkiSendQueue();
     stepAnki(1);
+    setTimeout(() => drainAnkiSendQueue(), 40);
   }
 
   function handleAnkiReply() {
@@ -3700,8 +3701,8 @@
     card.doneInSession = true;
 
     ankiSendQueue.push({ type: 'reply', card, text, label: '回覆' });
-    drainAnkiSendQueue();
     stepAnki(1);
+    setTimeout(() => drainAnkiSendQueue(), 40);
   }
 
   function getNativeHistoryList(grid) {
@@ -4003,14 +4004,14 @@
     applyGlobalFlags();
     refreshCacheCount();
 
-    // 觀察整個聊天室 DOM 變化（相容 Threads 虛擬化重繪）
+    // 觀察整個聊天室 DOM 變化（相容 Threads 虛擬化重繪；Anki 開啟或背景送出時暫停以免與翻卡搶主執行緒）
     let scanQueued = false;
     state.gridObserver = new MutationObserver(() => {
-      if (scanQueued) return;
+      if (scanQueued || ankiState.open || ankiState.isScanning || isDrainingAnkiQueue) return;
       scanQueued = true;
       requestAnimationFrame(() => {
         scanQueued = false;
-        if (!ankiState.isScanning) scanVisibleMessages();
+        if (!ankiState.open && !ankiState.isScanning && !isDrainingAnkiQueue) scanVisibleMessages();
       });
     });
 
@@ -4030,7 +4031,7 @@
     if (threadId) {
       if (threadId !== state.currentThreadId) {
         attachToCurrentThread(threadId);
-      } else {
+      } else if (!ankiState.open && !ankiState.isScanning && !isDrainingAnkiQueue) {
         scanVisibleMessages();
       }
     } else if (state.currentThreadId) {
