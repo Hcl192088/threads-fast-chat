@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.22
+// @version      0.5.23
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -13,7 +13,7 @@
 // @updateURL    https://raw.githubusercontent.com/Hcl192088/threads-fast-chat/main/threads-fast-chat.meta.js
 // @downloadURL  https://raw.githubusercontent.com/Hcl192088/threads-fast-chat/main/threads-fast-chat.user.js
 // @grant        none
-// @run-at       document-idle
+// @run-at       document-end
 // ==/UserScript==
 
 (function () {
@@ -53,10 +53,15 @@
 
   // ==================== 樣式注入 ====================
   const STYLES = `
-    /* 隱藏點擊快速表情時閃現的原生彈窗（不阻斷 pointer-events 以免干擾事件判定） */
-    html.tcf-hide-native-menu div[role="menu"] {
+    /* 隱藏點擊快速表情時閃現的原生彈窗；Anki 模式下阻斷原生彈窗吃掉下一張卡的點擊 */
+    html.tcf-hide-native-menu div[role="menu"],
+    html.tcf-hide-native-menu div[role="dialog"]:not(#tcf-anki-modal) {
       opacity: 0 !important;
       transition: none !important;
+    }
+    html.tcf-anki-open.tcf-hide-native-menu div[role="menu"],
+    html.tcf-anki-open.tcf-hide-native-menu div[role="dialog"]:not(#tcf-anki-modal) {
+      pointer-events: none !important;
     }
 
     /* 極速減重模式：關閉過場動畫、模糊特效與昂貴陰影 */
@@ -587,7 +592,7 @@
     #tcf-anki-modal {
       position: fixed;
       inset: 0;
-      z-index: 100005;
+      z-index: 2147483640;
       background: rgba(9, 9, 12, 0.88);
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
@@ -1137,11 +1142,13 @@
     target.dispatchEvent(new MouseEvent('mousemove', opts));
   }
 
-  function simulateRealClick(el) {
+  function simulateRealClick(el, shouldFocus = true) {
     if (!el) return;
-    try {
-      el.focus({ preventScroll: true });
-    } catch {}
+    if (shouldFocus) {
+      try {
+        el.focus({ preventScroll: true });
+      } catch {}
+    }
     const rect = el.getBoundingClientRect();
     const cx = rect.left + rect.width / 2;
     const cy = rect.top + rect.height / 2;
@@ -1285,11 +1292,14 @@
         return dialogBtns.find((b) => !b.querySelector('svg[title]')) || dialogBtns[0] || null;
       };
 
-      // 1. 永遠先嘗試喚醒 gridcell（React props + 冒泡 hover，不再鎖死 longPress）
+      // 1. 嘗試喚醒 gridcell；若在無滑鼠且讀不到 React props 的手機環境，縮短等待快速進入長按備援
+      const d2 = msgEl?.firstElementChild?.firstElementChild;
+      const hasReactProps = Boolean(d2 && Object.keys(d2).some((k) => k.startsWith('__reactProps$')));
+      const hoverWaitMs = !hasReactProps && 'ontouchstart' in window ? 60 : 400;
       let reactBtn = findReactBtn();
       if (!reactBtn) {
         hoverMessageRow(msgEl);
-        reactBtn = await waitForElement(findReactBtn, 400, 10);
+        reactBtn = await waitForElement(findReactBtn, hoverWaitMs, 10);
       }
 
       // 2. 暫時隱藏原生彈窗避免閃爍（若是開啟完整選單則不隱藏）
@@ -1298,9 +1308,10 @@
       }
 
       const existingMenus = new Set(document.querySelectorAll('div[role="menu"], div[role="dialog"]'));
+      const allowFocus = !ankiState.open;
 
       if (reactBtn) {
-        simulateRealClick(reactBtn);
+        simulateRealClick(reactBtn, allowFocus);
       } else {
         await triggerLongPressFallback(msgEl, existingMenus);
       }
@@ -1318,7 +1329,7 @@
 
       if (openFullPicker) {
         const plusBtn = buttons.find((b) => !b.textContent.trim() && b.querySelector('svg')) || buttons[buttons.length - 1];
-        if (plusBtn) simulateRealClick(plusBtn);
+        if (plusBtn) simulateRealClick(plusBtn, allowFocus);
         setStatus('已開啟更多表情');
         return { ok: true };
       }
@@ -1327,7 +1338,7 @@
       const emojiBtn = buttons.find((b) => normalizeEmoji(b.textContent) === targetNorm);
 
       if (emojiBtn) {
-        simulateRealClick(emojiBtn);
+        simulateRealClick(emojiBtn, allowFocus);
         setStatus(`已送出 ${emoji}`);
       } else {
         document.documentElement.classList.remove('tcf-hide-native-menu');
@@ -2927,8 +2938,15 @@
     `;
     document.body.appendChild(modal);
 
+    // 攔截事件冒泡，避免在 Anki 連刷點擊時觸發 Meta 全域 outside-click / dialog 干擾下一次點擊或關閉背景表情選單
+    const stopAnkiBubble = (e) => e.stopPropagation();
+    for (const evtName of ['pointerdown', 'mousedown', 'touchstart', 'touchend']) {
+      modal.addEventListener(evtName, stopAnkiBubble, { passive: true });
+    }
+
     // 點擊深色背景關閉
     modal.addEventListener('click', (e) => {
+      e.stopPropagation();
       if (e.target === modal) closeAnkiMode();
     });
 
@@ -3913,6 +3931,7 @@
     hideHoverPreview();
     ensureAnkiModalUI();
     ankiState.open = true;
+    document.documentElement.classList.add('tcf-anki-open');
     document.getElementById('tcf-anki-modal')?.classList.add('tcf-open');
     const threadId = state.currentThreadId;
     const pruningKey = `tcf_anki_pruned::${threadId}`;
@@ -3928,6 +3947,7 @@
 
   function closeAnkiMode() {
     ankiState.open = false;
+    document.documentElement.classList.remove('tcf-anki-open');
     const modal = document.getElementById('tcf-anki-modal');
     if (modal) {
       modal.classList.remove('tcf-open');
@@ -4036,9 +4056,19 @@
     setTimeout(checkRoute, 150);
     return res;
   };
-  window.addEventListener('popstate', () => setTimeout(checkRoute, 150));
+  window.addEventListener('popstate', () => setTimeout(checkRoute, 80));
+  window.addEventListener('hashchange', () => setTimeout(checkRoute, 80));
 
-  // 保底定期檢查（應對 React Router 內部切換與首次載入延遲）
+  // 快速偵測 SPA 路徑切換（在 Safari Userscripts 隔離環境中攔不到 page world 的 pushState）
+  let lastCheckedPathname = location.pathname;
+  setInterval(() => {
+    if (location.pathname !== lastCheckedPathname) {
+      lastCheckedPathname = location.pathname;
+      checkRoute();
+    }
+  }, 180);
+
+  // 保底定期檢查（應對初次渲染延遲與新訊息掃描）
   setInterval(checkRoute, 1000);
   checkRoute();
 })();
