@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         threads-fast-chat
 // @namespace    https://local.threads-fast-chat/
-// @version      0.5.29
+// @version      0.5.30
 // @description  Threads 網頁版聊天室加速（支援電腦與 iPhone Safari）：常駐一鍵表情列、🃏 Anki 字卡刷貼文模式（快捷鍵 1~6 選表情 + R 打字回覆 + 0ms 瞬切背景送出）、滑鼠懸停預覽、自動背景預載 0 閃動。
 // @author       Local
 // @match        https://www.threads.com/*
@@ -20,7 +20,7 @@
   'use strict';
 
   // ==================== 設定區 ====================
-  const SCRIPT_VERSION = '0.5.29';
+  const SCRIPT_VERSION = '0.5.30';
   const DEFAULT_EMOJIS = ['❤️', '🤣', '🔥', '👀', '🫠', '👍'];
   const STORAGE_KEYS = {
     fastMode: 'tcf_fast_mode',
@@ -3759,7 +3759,7 @@
     const data = getNativeMessageData(msgEl, messageId);
     const list = grid && getNativeHistoryList(grid);
     const hasNative = Boolean(data && list);
-    // 1. 掛載原生 hover gridcell 並點擊第 2 顆按鈕（無 aria-haspopup 的回覆鈕）
+    // 1. 掛載原生 hover gridcell 並點擊回覆鈕；手機環境若無 hover gridcell 則改用長按選單備援
     const findReplyBtn = () => {
       const gc = msgEl.querySelector('div[role="gridcell"]');
       if (!gc) return null;
@@ -3767,15 +3767,43 @@
       return btns.find((b) => !b.hasAttribute('aria-haspopup')) || btns[1] || null;
     };
 
+    const findReplyMenuItem = (existingMenus) => {
+      const containers = Array.from(document.querySelectorAll('div[role="menu"], div[role="dialog"]')).filter(
+        (el) => !existingMenus.has(el) && !el.closest('#tcf-anki-modal, #tcf-drawer, #tcf-hover-preview')
+      );
+      for (const box of containers) {
+        const items = Array.from(box.querySelectorAll('[role="menuitem"], [role="button"], button'));
+        const exact = items.find((el) => /^(回覆|Reply)$/i.test((el.textContent || el.getAttribute('aria-label') || '').trim()));
+        if (exact) return exact;
+        const fuzzy = items.find((el) => /回覆|Reply/i.test((el.textContent || el.getAttribute('aria-label') || '').trim()));
+        if (fuzzy) return fuzzy;
+      }
+      return null;
+    };
+
+    const d2 = msgEl?.firstElementChild?.firstElementChild;
+    const hasReactProps = Boolean(d2 && Object.keys(d2).some((k) => k.startsWith('__reactProps$')));
+    const hoverWaitMs = !hasReactProps && 'ontouchstart' in window ? 80 : 500;
     let replyBtn = findReplyBtn();
     if (!replyBtn) {
       hoverMessageRow(msgEl);
-      replyBtn = await waitForElement(findReplyBtn, 500, 20);
+      replyBtn = await waitForElement(findReplyBtn, hoverWaitMs, 20);
+    }
+
+    if (!replyBtn) {
+      const existingMenus = new Set(document.querySelectorAll('div[role="menu"], div[role="dialog"]'));
+      document.documentElement.classList.add('tcf-hide-native-menu');
+      try {
+        await triggerLongPressFallback(msgEl, existingMenus);
+        replyBtn = await waitForElement(() => findReplyMenuItem(existingMenus), 650, 20);
+      } finally {
+        document.documentElement.classList.remove('tcf-hide-native-menu');
+      }
     }
     if (!replyBtn) throw new Error('找不到原生回覆按鈕');
 
-    simulateRealClick(replyBtn);
-    await sleep(160);
+    simulateRealClick(replyBtn, !ankiState.open);
+    await sleep(180);
 
     // 2. 找到聊天室底部 Lexical 輸入框並輸入文字
     const textbox = await waitForElement(
@@ -3783,7 +3811,7 @@
         Array.from(document.querySelectorAll('div[contenteditable="true"][role="textbox"]')).find(
           (el) => !el.closest('#tcf-anki-modal')
         ) || null,
-      600,
+      800,
       25
     );
     if (!textbox) throw new Error('找不到聊天室輸入框');
@@ -3791,9 +3819,12 @@
     textbox.focus();
     await sleep(40);
 
-    // 使用 execCommand('insertText') 相容 Meta Lexical Editor
-    const inserted = document.execCommand('insertText', false, replyText);
-    if (!inserted) {
+    // 使用 execCommand('insertText') + Lexical beforeinput / paste 備援（相容 iOS Safari）
+    let inserted = false;
+    try {
+      inserted = document.execCommand('insertText', false, replyText);
+    } catch {}
+    if (!inserted || !(textbox.textContent || '').includes(replyText)) {
       textbox.dispatchEvent(
         new InputEvent('beforeinput', {
           inputType: 'insertText',
@@ -3802,24 +3833,55 @@
           cancelable: true,
         })
       );
+      await sleep(30);
+    }
+    if (!(textbox.textContent || '').includes(replyText)) {
+      try {
+        const dt = new DataTransfer();
+        dt.setData('text/plain', replyText);
+        textbox.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+      } catch {}
+      await sleep(40);
+    }
+    if (!(textbox.textContent || '').trim()) {
+      throw new Error('無法將文字填入聊天室輸入框');
     }
     await sleep(120);
 
-    // 3. 送出（派發 Enter 鍵）
+    // 3. 送出（行動版優先點擊輸入框旁的傳送鈕，找不到再派發 Enter 鍵）
     const previousIds = hasNative
       ? new Set(list.items.map((item) => item.as_micg_interface?.message_id))
       : new Set(Array.from(grid?.querySelectorAll('div[data-message-id^="mid."]') || [], (el) => el.getAttribute('data-message-id')));
-    const enterOpts = {
-      key: 'Enter',
-      code: 'Enter',
-      keyCode: 13,
-      which: 13,
-      bubbles: true,
-      cancelable: true,
+    const findSendBtn = () => {
+      let scope = textbox.parentElement;
+      for (let i = 0; i < 4 && scope; i++, scope = scope.parentElement) {
+        const btns = Array.from(scope.querySelectorAll('[role="button"], button')).filter(
+          (b) => !b.closest('#tcf-anki-modal') && b.getAttribute('aria-disabled') !== 'true' && !b.disabled
+        );
+        const matched = btns.find((b) => {
+          const label = `${b.getAttribute('aria-label') || ''} ${b.textContent || ''}`.trim();
+          return /^(傳送|送出|Send)$/i.test(label) || /傳送|送出|Send/i.test(label);
+        });
+        if (matched) return matched;
+      }
+      return null;
     };
-    textbox.dispatchEvent(new KeyboardEvent('keydown', enterOpts));
-    textbox.dispatchEvent(new KeyboardEvent('keypress', enterOpts));
-    textbox.dispatchEvent(new KeyboardEvent('keyup', enterOpts));
+    const sendBtn = findSendBtn();
+    if (sendBtn) {
+      simulateRealClick(sendBtn, !ankiState.open);
+    } else {
+      const enterOpts = {
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true,
+      };
+      textbox.dispatchEvent(new KeyboardEvent('keydown', enterOpts));
+      textbox.dispatchEvent(new KeyboardEvent('keypress', enterOpts));
+      textbox.dispatchEvent(new KeyboardEvent('keyup', enterOpts));
+    }
     const confirmed = hasNative
       ? await waitForElement(() => getNativeHistoryList(grid)?.items.some((item) => {
           const msg = item.as_micg_interface;
